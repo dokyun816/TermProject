@@ -1,0 +1,250 @@
+# 사용자가 회사 검색시 csv파일에서 회사 정보 가져옴
+import pandas as pd
+import re
+
+import pandas as pd
+from tabulate import tabulate
+import os
+
+# ===== CSV 경로 설정 =====
+CSV_PATH = r"C:\Users\dokyu\TERM Project\corp_codes.csv"
+
+if not os.path.exists(CSV_PATH):
+    raise FileNotFoundError(f"{CSV_PATH} 파일이 없습니다. 먼저 준비해주세요.")
+
+# CSV 불러오기
+df = pd.read_csv(CSV_PATH, dtype=str)
+
+
+# ===== 검색 함수 =====
+def lookup_company_pretty(df: pd.DataFrame, query: str, limit: int = 20) -> pd.DataFrame:
+    """
+    - 회사명/종목코드 부분검색
+    - 출력: 회사명, 종목코드, corp_code
+    """
+    q = (query or "").strip()
+    if not q:
+        return pd.DataFrame(columns=["회사명", "종목코드", "corp_code"])
+
+    mask = (
+        df["corp_name"].str.contains(q, case=False, na=False) |
+        df["stock_code"].str.contains(q, na=False)
+    )
+    sub = df.loc[mask, ["corp_name", "stock_code", "corp_code"]].drop_duplicates()
+
+    if sub.empty:
+        return pd.DataFrame(columns=["회사명", "종목코드", "corp_code"])
+
+    # 스코어링
+    q_ci = q.casefold()
+    def score(row):
+        name = (row["corp_name"] or "").casefold()
+        code = (row["stock_code"] or "")
+        exact = 1 if (name == q_ci or code == q) else 0
+        starts = 1 if (name.startswith(q_ci) or (code.startswith(q) if code else False)) else 0
+        contains = 1 if (q_ci in name or (q in code if code else False)) else 0
+        listed = 1 if isinstance(code, str) and code.strip() else 0
+        return (exact*100) + (starts*10) + contains + (listed*5)
+
+    sub = sub.copy()
+    sub["__score"] = sub.apply(score, axis=1)
+    sub["__name_len"] = sub["corp_name"].str.len().fillna(9999)
+    sub["__listed"] = sub["stock_code"].notna() & sub["stock_code"].astype(str).str.len().gt(0)
+
+    sub = sub.sort_values(
+        by=["__score", "__listed", "__name_len", "corp_name", "stock_code"],
+        ascending=[False, False, True, True, True]
+    )
+
+    # 컬럼 정리
+    sub = sub.head(limit)
+    sub = sub.rename(columns={"corp_name": "회사명", "stock_code": "종목코드"})
+    sub["종목코드"] = sub["종목코드"].fillna("").astype(str)
+    sub["corp_code"] = sub["corp_code"].fillna("").astype(str)
+
+    return sub[["회사명", "종목코드", "corp_code"]]
+
+
+# ===== 표 출력 함수 =====
+def show_table(df: pd.DataFrame):
+    print(tabulate(df, headers="keys", tablefmt="grid", showindex=False))
+
+
+# ===== 실행부 =====
+if __name__ == "__main__":
+    company_name = input("조회할 회사명(또는 종목코드)을 입력하세요: ").strip()
+    result = lookup_company_pretty(df, company_name)
+
+    if result.empty:
+        print("검색 결과가 없습니다.")
+    else:
+        show_table(result)
+
+#---------
+#%%
+#회사의 정보를 입력하고(앞서 회사이름검색을 통해
+# 회사 종목코드를 알았으니), 회사의 재무데이터 출력
+import requests
+import pandas as pd
+from tabulate import tabulate
+import math
+
+# ========= 기본 설정 =========
+API_KEY = "32ba89ca15f1fde1cb7116b4e08b2959c861f4e4"   
+PREFERRED_FS = "CFS"            # 연결재무제표("CFS") 또는 개별("OFS")
+DEFAULT_REPRT = "11014"         # 11011=1분기, 11012=반기, 11013=3분기, 11014=사업보고서(연간)
+
+# ========= 유틸 =========
+def _to_number(s):
+    """문자 금액을 숫자로 변환"""
+    if s is None:
+        return math.nan
+    s = str(s).replace(",", "").strip()
+    if s == "" or s == "-":
+        return math.nan
+    try:
+        return float(s)
+    except Exception:
+        return math.nan
+
+def show_table(df: pd.DataFrame):
+    """콘솔에서 엑셀처럼 반듯한 표 출력"""
+    print(tabulate(df, headers="keys", tablefmt="grid", showindex=False))
+
+# ========= DART 호출 =========
+def fetch_fnltt_single_year(api_key: str, corp_code: str, year: int,
+                            reprt_code: str = DEFAULT_REPRT,
+                            fs_div: str = PREFERRED_FS) -> pd.DataFrame:
+    """특정 연도/보고서의 재무제표 전체 계정 가져오기"""
+    url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+    params = {
+        "crtfc_key": api_key,
+        "corp_code": corp_code,
+        "bsns_year": str(year),
+        "reprt_code": reprt_code,
+        "fs_div": fs_div
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+
+    j = r.json()
+    status = str(j.get("status", ""))
+    if status != "000":
+        msg = j.get("message", "")
+        raise RuntimeError(f"DART 에러(status={status}): {msg}")
+
+    rows = j.get("list", []) or []
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    keep = ["account_id","account_nm","sj_div","thstrm_amount",
+            "frmtrm_amount","bfefrmtrm_amount"]
+    for k in keep:
+        if k not in df.columns:
+            df[k] = None
+    df = df[keep].copy()
+
+    for col in ["thstrm_amount","frmtrm_amount","bfefrmtrm_amount"]:
+        df[col] = df[col].map(_to_number)
+
+    df.insert(0, "year", int(year))
+    df.insert(1, "reprt_code", reprt_code)
+    df.insert(2, "fs_div", fs_div)
+    return df
+
+
+def fetch_fnltt_multi_year(api_key: str, corp_code: str, years: list[int],
+                           reprt_code: str = DEFAULT_REPRT,
+                           fs_div: str = PREFERRED_FS) -> pd.DataFrame:
+    """여러 연도를 묶어서 반환"""
+    frames = []
+    for y in years:
+        try:
+            frames.append(fetch_fnltt_single_year(api_key, corp_code, y, reprt_code, fs_div))
+        except Exception as e:
+            print(f"[경고] {y}년 조회 실패: {e}")
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+# ========= 핵심 계정 선별 =========
+def select_key_accounts(df_all: pd.DataFrame) -> pd.DataFrame:
+    """
+    핵심 계정만 선별하여 연도별 표 정리
+    - 매출액, 영업이익, 당기순이익
+    - 자산총계, 부채총계, 자본총계
+    단위: 원 (세자리 콤마)
+    """
+    if df_all.empty:
+        return pd.DataFrame()
+
+    targets = {
+        "매출액": ["매출액", "수익"],
+        "영업이익": ["영업이익"],
+        "당기순이익": ["당기순이익","분기순이익","반기순이익","연결총포괄손익","당기순손익"],
+        "자산총계": ["자산총계"],
+        "부채총계": ["부채총계"],
+        "자본총계": ["자본총계","지배기업의소유주지분"]
+    }
+
+    out_rows = []
+    for metric, candidates in targets.items():
+        sub = df_all[df_all["account_nm"].notna()].copy()
+        name_ci = sub["account_nm"].str.casefold()
+        mask = False
+        for c in candidates:
+            mask = mask | name_ci.str.contains(str(c).casefold(), na=False)
+        sub = sub[mask]
+        if sub.empty:
+            continue
+        sub = sub.copy()
+        sub["abs_amount"] = sub["thstrm_amount"].abs()
+        sub = sub.sort_values(["year","abs_amount"], ascending=[True, False])
+        picked = sub.groupby("year", as_index=False).first()
+        picked["지표"] = metric
+        picked = picked[["지표","year","thstrm_amount"]]
+        out_rows.append(picked)
+
+    if not out_rows:
+        return pd.DataFrame()
+
+    key = pd.concat(out_rows, ignore_index=True)
+    pivot = key.pivot(index="지표", columns="year", values="thstrm_amount").sort_index()
+
+    # 세자리 콤마 포맷 (원 단위)
+    pivot = pivot.applymap(lambda x: f"{int(x):,}" if pd.notna(x) else "")
+
+    pivot = pivot.reindex(sorted(pivot.columns), axis=1)
+    order = ["매출액","영업이익","당기순이익","자산총계","부채총계","자본총계"]
+    pivot = pivot.reindex(order)
+
+    pivot = pivot.rename_axis(None, axis=0)
+    pivot.columns = [f"{c}년(원)" for c in pivot.columns]
+    pivot = pivot.reset_index().rename(columns={"지표": "계정과목"})
+    return pivot
+
+# ========= 실행부 =========
+if __name__ == "__main__":
+    corp_code = input("조회할 corp_code를 입력하세요 (예: 00164779=SK하이닉스): ").strip()
+    years_str = input("조회할 연도들을 쉼표로 입력 (예: 2021,2022,2023,2024): ").strip()
+    years = [int(s) for s in years_str.split(",") if s.strip().isdigit()]
+
+    if not corp_code or not years:
+        print("corp_code와 연도를 올바르게 입력하세요.")
+        raise SystemExit
+
+    all_df = fetch_fnltt_multi_year(API_KEY, corp_code, years,
+                                    reprt_code=DEFAULT_REPRT, fs_div=PREFERRED_FS)
+
+    if all_df.empty:
+        print("조회된 재무 데이터가 없습니다.")
+        raise SystemExit
+
+    table = select_key_accounts(all_df)
+    if table.empty:
+        print("핵심 계정을 찾지 못했습니다. 원시 데이터 예시:")
+        print(all_df.head(10).to_string(index=False))
+    else:
+        print("\n[핵심 재무지표 표] (단위: 원)")
+        show_table(table)
