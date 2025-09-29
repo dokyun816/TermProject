@@ -1,0 +1,177 @@
+# 재무데이터를 그래프로 출력
+import requests, math
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.ticker import FuncFormatter
+
+API_KEY = "32ba89ca15f1fde1cb7116b4e08b2959c861f4e4"
+PREFERRED_FS = "CFS"            # "CFS"(연결) / "OFS"(개별)
+DEFAULT_REPRT = "11014"         # 11011=1Q, 11012=반기, 11013=3Q, 11014=연간
+
+# ===== 유틸 =====
+def _to_number(s):
+    if s is None: return math.nan
+    s = str(s).replace(",", "").strip()
+    if s == "" or s == "-": return math.nan
+    try: return float(s)
+    except: return math.nan
+
+# ===== DART 호출 =====
+def fetch_fnltt_single_year(api_key, corp_code, year, reprt_code=DEFAULT_REPRT, fs_div=PREFERRED_FS):
+    url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+    params = {"crtfc_key": api_key, "corp_code": corp_code,
+              "bsns_year": str(year), "reprt_code": reprt_code, "fs_div": fs_div}
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    if str(j.get("status", "")) != "000":
+        raise RuntimeError(f"DART 에러: {j.get('message','')}")
+    rows = j.get("list", []) or []
+    if not rows: return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    keep = ["account_id","account_nm","sj_div","thstrm_amount","frmtrm_amount","bfefrmtrm_amount"]
+    for k in keep:
+        if k not in df.columns: df[k] = None
+    df = df[keep].copy()
+    for col in ["thstrm_amount","frmtrm_amount","bfefrmtrm_amount"]:
+        df[col] = df[col].map(_to_number)
+    df.insert(0, "year", int(year))
+    df.insert(1, "reprt_code", reprt_code)
+    df.insert(2, "fs_div", fs_div)
+    return df
+
+def fetch_fnltt_multi_year(api_key, corp_code, years, reprt_code=DEFAULT_REPRT, fs_div=PREFERRED_FS):
+    frames = []
+    for y in years:
+        try:
+            frames.append(fetch_fnltt_single_year(api_key, corp_code, y, reprt_code, fs_div))
+        except Exception as e:
+            print(f"[경고] {y}년 조회 실패: {e}")
+    if not frames: return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+# ===== 핵심 계정 피벗(숫자용) =====
+def build_key_accounts_pivot_numeric(df_all: pd.DataFrame) -> pd.DataFrame:
+    if df_all.empty: return pd.DataFrame()
+    targets = {
+        "매출액": ["매출액","수익"],
+        "영업이익": ["영업이익"],
+        "당기순이익": ["당기순이익","분기순이익","반기순이익","연결총포괄손익","당기순손익"],
+        "자산총계": ["자산총계"],
+        "부채총계": ["부채총계"],
+        "자본총계": ["자본총계","지배기업의소유주지분"]
+    }
+    out = []
+    sub_all = df_all[df_all["account_nm"].notna()].copy()
+    name_ci = sub_all["account_nm"].str.casefold()
+
+    for metric, cands in targets.items():
+        mask = False
+        for c in cands:
+            mask = mask | name_ci.str.contains(str(c).casefold(), na=False)
+        sub = sub_all[mask].copy()
+        if sub.empty: continue
+        sub["abs_amount"] = sub["thstrm_amount"].abs()
+        sub = sub.sort_values(["year","abs_amount"], ascending=[True, False])
+        picked = sub.groupby("year", as_index=False).first()
+        picked["지표"] = metric
+        out.append(picked[["지표","year","thstrm_amount"]])
+
+    if not out: return pd.DataFrame()
+    key = pd.concat(out, ignore_index=True)
+    pivot = key.pivot(index="지표", columns="year", values="thstrm_amount")
+
+    # 지표 순서 & 연도 정렬
+    pivot = pivot.reindex(["매출액","영업이익","당기순이익","자산총계","부채총계","자본총계"])
+    pivot = pivot.reindex(sorted(pivot.columns), axis=1)
+    return pivot
+
+# ===== 그래프 (저장 X, 화면 표시만) =====
+def plot_key_accounts_console(pivot_numeric: pd.DataFrame, UNIT="억원"):
+    """
+    UNIT: "원" 또는 "억원"
+    """
+    if pivot_numeric.empty:
+        print("[경고] 그래프용 데이터가 비어있습니다.")
+        return
+
+    scale = 1.0
+    y_label = "금액(원)"
+    if UNIT == "억원":
+        scale = 1e8
+        y_label = "금액(억원)"
+
+    # 스케일 적용
+    data = pivot_numeric / scale
+    years = list(data.columns)
+
+    fmt = FuncFormatter(lambda y, _: f"{y:,.0f}")
+
+    # ① 손익 3종 라인
+    income_metrics = [m for m in ["매출액","영업이익","당기순이익"] if m in data.index]
+    if income_metrics:
+        plt.figure(figsize=(8,5))
+        for m in income_metrics:
+            plt.plot(years, data.loc[m, years], marker='o', label=m)
+        plt.title(f"손익지표 추이 ({UNIT})")
+        plt.xlabel("연도")
+        plt.ylabel(y_label)
+        plt.grid(True)
+        plt.gca().yaxis.set_major_formatter(fmt)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    # ② 손익 3종 막대
+    if income_metrics:
+        x = np.arange(len(years))
+        width = 0.25 if len(income_metrics) >= 3 else (0.35 if len(income_metrics)==2 else 0.5)
+        plt.figure(figsize=(8,5))
+        for i, m in enumerate(income_metrics):
+            vals = data.loc[m, years].values
+            plt.bar(x + (i - (len(income_metrics)-1)/2)*width, vals, width, label=m)
+        plt.xticks(x, years)
+        plt.title(f"연도별 손익지표 ({UNIT})")
+        plt.ylabel(y_label)
+        plt.gca().yaxis.set_major_formatter(fmt)
+        plt.grid(axis="y", alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    # ③ 재무상태표 3종 막대
+    bs_metrics = [m for m in ["자산총계","부채총계","자본총계"] if m in data.index]
+    if bs_metrics:
+        x = np.arange(len(years))
+        width = 0.25 if len(bs_metrics) >= 3 else (0.35 if len(bs_metrics)==2 else 0.5)
+        plt.figure(figsize=(8,5))
+        for i, m in enumerate(bs_metrics):
+            vals = data.loc[m, years].values
+            plt.bar(x + (i - (len(bs_metrics)-1)/2)*width, vals, width, label=m)
+        plt.xticks(x, years)
+        plt.title(f"연도별 재무상태표 ({UNIT})")
+        plt.ylabel(y_label)
+        plt.gca().yaxis.set_major_formatter(fmt)
+        plt.grid(axis="y", alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+# ===== 실행부 =====
+if __name__ == "__main__":
+    corp_code = input("corp_code (예: 00164779=SK하이닉스): ").strip()
+    years_str = input("연도들 (예: 2021,2022,2023,2024): ").strip()
+    years = [int(s) for s in years_str.split(",") if s.strip().isdigit()]
+    if not corp_code or not years:
+        print("corp_code와 연도를 올바르게 입력하세요.")
+        raise SystemExit
+
+    all_df = fetch_fnltt_multi_year(API_KEY, corp_code, years,
+                                    reprt_code=DEFAULT_REPRT, fs_div=PREFERRED_FS)
+    if all_df.empty:
+        print("조회된 재무 데이터가 없습니다.")
+        raise SystemExit
+
+    pivot_num = build_key_accounts_pivot_numeric(all_df)
+    plot_key_accounts_console(pivot_num, UNIT="억원")  # "원"으로 바꾸면 원 단위로 표시
