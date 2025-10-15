@@ -1,0 +1,175 @@
+# 회사명 → DART corpCode.xml에서 종목코드 찾기
+# 네이버 증권에서 PER/PBR/EPS/BPS/시총/현재가 가져오기
+
+import io, zipfile, requests, math
+import xml.etree.ElementTree as ET
+import pandas as pd
+from bs4 import BeautifulSoup
+
+API_KEY = "32ba89ca15f1fde1cb7116b4e08b2959c861f4e4"  # ← 본인 DART API 키 입력
+
+# 1) DART corpCode.xml 파싱
+#    - DART(Open DART)에서 제공하는 상장/비상장 법인 코드 목록(corpCode.xml)을 내려받아
+#      '회사명-법인코드-종목코드' 매핑 테이블을 만든다.
+#    - 종목코드(stock_code)가 있는 행은 '상장사'를 의미한다(6자리 숫자).
+
+def fetch_corpcode_df(api_key: str) -> pd.DataFrame:
+    """
+    corpCode.xml(zip)을 내려받아 DataFrame으로 변환
+    컬럼: corp_code, corp_name, stock_code(6자리 또는 빈 문자열)
+    """
+    # DART API의 corpCode.xml 엔드포인트
+    url = "https://opendart.fss.or.kr/api/corpCode.xml"
+
+    # 1) 요청: 인증키를 쿼리스트링으로 전달
+    r = requests.get(url, params={"crtfc_key": api_key}, timeout=30)
+    r.raise_for_status()  # HTTP 오류 발생 시 예외
+    # 2) 응답은 ZIP 파일 바이트 → 메모리에서 바로 ZipFile로 읽기
+    zf = zipfile.ZipFile(io.BytesIO(r.content))
+    # 3) ZIP 내부에는 xml 파일이 1개 존재 → 그 파일을 다시 바이트로 추출
+    xml_bytes = zf.read(zf.namelist()[0])
+    # 4) XML 파싱: ElementTree로 루트 노드 획득
+    root = ET.fromstring(xml_bytes)
+    # 5) <list> 태그 단위로 필요한 필드 추출
+    rows = []
+    for el in root.findall(".//list"):
+        rows.append({
+            "corp_code": (el.findtext("corp_code") or "").strip(),   # 법인코드(8자리)
+            "corp_name": (el.findtext("corp_name") or "").strip(),   # 회사명(법인명)
+            "stock_code": (el.findtext("stock_code") or "").strip(), # 상장사의 경우 6자리 종목코드, 비상장은 빈문자열
+        })
+    # 6) 판다스 DataFrame으로 변환
+    df = pd.DataFrame(rows)
+    # 7) 반환: 상장/비상장 모두 포함(후속 단계에서 상장사만 필터링)
+    return df
+
+
+
+#      회사명으로 종목코드 찾기
+#      - 사용자가 입력한 회사명을 DART 테이블에서 찾는다.
+#      - 상장사(= stock_code 6자리 보유)만 대상으로 검색한다.
+
+def find_stock_code_by_name(df: pd.DataFrame, name: str) -> pd.Series | None:
+    """
+    회사명으로 우선순위 매칭하여 단일 후보 반환:
+      1) 완전일치(대소문자 무시) > 2) 시작일치 > 3) 부분일치
+    """
+    if df.empty:
+        return None
+
+    base = df.copy()
+    base["__n"] = base["corp_name"].str.casefold()  # 대소문자 무시 비교용 컬럼
+    key = name.casefold()
+
+    # 종목코드가 정확히 6자리인 상장사만 필터
+    base = base[base["stock_code"].str.len() == 6]
+
+    # 1) 완전일치
+    exact = base[base["__n"] == key]
+    if not exact.empty:
+        return exact.iloc[0]
+
+    # 2) 시작일치 (예: "삼성" → "삼성전자", "삼성물산" 등)
+    starts = base[base["__n"].str.startswith(key)]
+    if not starts.empty:
+        return starts.iloc[0]
+
+    # 3) 부분일치 (이름 일부만 알아도 검색 가능)
+    contains = base[base["__n"].str.contains(key, na=False)]
+    if not contains.empty:
+        return contains.iloc[0]
+
+    # 찾지 못한 경우
+    return None
+
+
+# ------------------------------------------------------------
+# 2) 네이버 증권에서 지표 수집
+#    - 종목코드(6자리)로 종목 메인 페이지에 접근하여
+#      PER, PBR, EPS, BPS, 시가총액, 상장주식수, 현재가 등을 파싱한다.
+
+def _to_float_or_nan(s: str):
+    """
+    문자열(천단위 콤마, '배' 등 단위 문자열 포함 가능)을 float로 변환.
+    변환 불가/결측은 NaN으로 처리.
+    """
+    s = (s or "").replace(",", "").replace("배", "").strip()
+    if s in ["", "-", "N/A", "NaN"]:
+        return math.nan
+    try:
+        return float(s)
+    except:
+        return math.nan
+
+
+def get_valuation_from_naver(stock_code: str) -> dict:
+    """
+    stock_code: 6자리 (예: '005930', '000660')
+    반환: PER/PBR/EPS/BPS, 시가총액(원), 상장주식수(주), 현재가(원)
+    """
+    # 네이버 종목 메인 URL (code=6자리 종목코드)
+    url = f"https://finance.naver.com/item/main.nhn?code={stock_code}"
+    headers = {"User-Agent": "Mozilla/5.0"}  # 간단한 UA 지정(차단 회피 용도)
+
+    # 1) HTML 요청
+    r = requests.get(url, headers=headers, timeout=15)
+    r.raise_for_status()
+
+    # 2) 파서 준비
+    soup = BeautifulSoup(r.text, "lxml")
+
+    # 3) '테이블 헤더 텍스트(th)'에 특정 라벨이 들어간 셀을 찾아
+    #    바로 오른쪽(td) 값을 읽는 유틸리티
+    def grab(label):
+        for th in soup.find_all("th"):
+            txt = th.get_text(strip=True)
+            if label in txt:                    # 예: "PER", "PBR", "BPS" 등
+                td = th.find_next_sibling("td") # 같은 행의 바로 오른쪽 값
+                if td:
+                    return td.get_text(strip=True)
+        return ""
+
+    # 4) 필요한 지표 수집 후 숫자 변환
+    return {
+        "현재가(원)": _to_float_or_nan(grab("현재가") or grab("종가")),
+        "시가총액(원)": _to_float_or_nan(grab("시가총액")),
+        "상장주식수(주)": _to_float_or_nan(grab("상장주식수")),
+        "EPS": _to_float_or_nan(grab("EPS")),
+        "BPS": _to_float_or_nan(grab("BPS")),
+        "PER": _to_float_or_nan(grab("PER")),
+        "PBR": _to_float_or_nan(grab("PBR")),
+    }
+
+
+# ====실행부=====
+if __name__ == "__main__":
+    # 1) 회사명 입력(예: 삼성전자, SK하이닉스 등)
+    company = input("조회할 회사명: ").strip()
+
+    # 2) DART corpCode.xml → 종목코드 찾기
+    corp_df = fetch_corpcode_df(API_KEY)
+    row = find_stock_code_by_name(corp_df, company)
+
+    if row is None:
+        # 상장사에서 매칭 실패 시 안내 후 종료(불필요한 Traceback 방지)
+        print("상장사에서 회사명을 찾지 못했습니다. (철자/띄어쓰기 확인)")
+        raise SystemExit
+
+    stock_code = row["stock_code"]  # 6자리(상장 종목코드)
+    corp_code  = row["corp_code"]   # 8자리(법인코드)
+    corp_name  = row["corp_name"]   # 회사명(법인명)
+
+    print(f"[매칭] {corp_name} / 종목코드: {stock_code} / corp_code: {corp_code}")
+
+    # 3) 네이버 증권에서 밸류에이션 지표 수집
+    val = get_valuation_from_naver(stock_code)
+
+    # 4) 결과 출력(숫자는 보기 좋게 포매팅)
+    print("\n[네이버 증권 지표]")
+    for k, v in val.items():
+        if isinstance(v, float) and not math.isnan(v):
+            # 숫자인 경우: 천단위 콤마(+ 소수점 2자리)
+            print(f"- {k}: {v:,.2f}")
+        else:
+            # NaN/문자열은 그대로 출력
+            print(f"- {k}: {v}")
