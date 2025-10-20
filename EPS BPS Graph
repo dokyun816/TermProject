@@ -1,0 +1,162 @@
+# ==== pykrx로 주식수 확보 → EPS/BPS 계산 → 간단 예측치 산출 ====
+import re, datetime as dt
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+
+# --------------------------
+# 0) 유틸
+# --------------------------
+def _num(x):
+    if x is None: return np.nan
+    if isinstance(x, (int, float, np.number)): return float(x)
+    return pd.to_numeric(re.sub(r"[^\d\-\.+]", "", str(x)), errors="coerce")
+
+# --------------------------
+# 1) pykrx: 상장주식수
+# --------------------------
+def _recent_trading_day():
+    from pykrx import stock
+    d = dt.date.today()
+    for _ in range(10):
+        s = d.strftime("%Y%m%d")
+        if not stock.get_market_cap_by_date(s, s, "005930").empty:
+            return s
+        d -= dt.timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+def get_listed_shares_by_pykrx(code: str) -> int:
+    from pykrx import stock
+    day = _recent_trading_day()
+    df = stock.get_market_cap_by_date(day, day, code)
+    if df.empty:
+        raise ValueError("KRX 데이터 비어 있음")
+    return int(df.iloc[0]["상장주식수"])
+
+# --------------------------
+# 2) DART 표에서 연도별 항목 뽑기
+#    all_df: ['year' or 'bsns_year', 'account_nm', 'thstrm_amount']
+# --------------------------
+def _pick_yearly(df: pd.DataFrame, names: list[str]) -> pd.Series:
+    if df.empty or "account_nm" not in df: return pd.Series(dtype=float)
+    base = df[df["account_nm"].notna()].copy()
+    base["year"] = base.get("year", base.get("bsns_year"))
+    if base["year"] is None or base["year"].isna().all(): return pd.Series(dtype=float)
+
+    pat = "|".join(map(lambda s: re.escape(s.casefold()), names))
+    sub = base[base["account_nm"].astype(str).str.casefold().str.contains(pat, na=False)].copy()
+    if sub.empty: return pd.Series(dtype=float)
+
+    sub["thstrm_amount"] = sub["thstrm_amount"].map(_num)
+    sub["year"] = pd.to_numeric(sub["year"], errors="coerce")
+    sub = sub.dropna(subset=["thstrm_amount","year"])
+    if sub.empty: return pd.Series(dtype=float)
+
+    sub["abs_amount"] = sub["thstrm_amount"].abs()
+    pick = (sub.sort_values(["year","abs_amount"], ascending=[True, False])
+              .groupby("year", as_index=False).first())
+    return pd.Series(pick["thstrm_amount"].values, index=pick["year"].astype(int)).sort_index()
+
+# --------------------------
+# 3) EPS/BPS 계산
+# --------------------------
+def build_eps_bps(all_df: pd.DataFrame, shares) -> pd.DataFrame:
+    sh = _num(shares)
+    if all_df.empty or pd.isna(sh) or sh <= 0: return pd.DataFrame()
+    ni = _pick_yearly(all_df, ["당기순이익","분기순이익","반기순이익","당기순손익","연결총포괄손익"])
+    eq = _pick_yearly(all_df, ["자본총계","지배기업의소유주지분"])
+    years = sorted(set(ni.index) | set(eq.index))
+    if not years: return pd.DataFrame()
+    out = pd.DataFrame(index=years, dtype=float)
+    if not ni.empty: out["EPS"] = ni / sh
+    if not eq.empty: out["BPS"] = eq / sh
+    return out
+
+# --------------------------
+# 4) 간단 예측치
+#    - EPS: 선형회귀(연도→EPS)로 1~k년 앞 예측
+#    - BPS: 과거 CAGR로 1~k년 앞 예측
+# --------------------------
+def forecast_eps_bps(eps_bps: pd.DataFrame, years_ahead: int = 1) -> pd.DataFrame:
+    if eps_bps.empty: return pd.DataFrame()
+    idx_years = eps_bps.index.astype(int).to_numpy()
+    fut_years = np.arange(idx_years.max() + 1, idx_years.max() + 1 + years_ahead)
+
+    out = pd.DataFrame(index=fut_years, columns=["EPS_pred","BPS_pred"], dtype=float)
+
+    # EPS: 선형회귀
+    if "EPS" in eps_bps and eps_bps["EPS"].notna().sum() >= 2:
+        x = idx_years[eps_bps["EPS"].notna()]
+        y = eps_bps.loc[x, "EPS"].to_numpy()
+        m, b = np.polyfit(x, y, 1)  # 1차
+        out["EPS_pred"] = m * fut_years + b
+
+    # BPS: CAGR
+    if "BPS" in eps_bps and eps_bps["BPS"].notna().sum() >= 2:
+        bps = eps_bps["BPS"].dropna()
+        y0, yN = int(bps.index.min()), int(bps.index.max())
+        n = yN - y0
+        if n > 0 and bps.loc[y0] > 0:
+            cagr = (bps.loc[yN] / bps.loc[y0]) ** (1/n) - 1
+            last_bps = bps.loc[yN]
+            preds = [last_bps * ((1 + cagr) ** t) for t in range(1, years_ahead + 1)]
+            out["BPS_pred"] = preds
+
+    return out
+
+# --------------------------
+# 5) 간단 플롯
+# --------------------------
+def plot_eps_bps_with_forecast(hist: pd.DataFrame, fc: pd.DataFrame):
+    fmt = FuncFormatter(lambda y,_: f"{y:,.0f}")
+
+    def _plot_one(col, title):
+        plt.figure(figsize=(8,4.5))
+        if col in hist and hist[col].notna().any():
+            y = hist[col].dropna(); x = y.index.astype(int)
+            plt.plot(x, y.values, marker="o", label=f"{col} (hist)")
+        if not fc.empty and f"{col}_pred" in fc and fc[f"{col}_pred"].notna().any():
+            y2 = fc[f"{col}_pred"].dropna(); x2 = y2.index.astype(int)
+            plt.plot(x2, y2.values, marker="o", linestyle="--", label=f"{col} (pred)")
+        plt.title(title); plt.xlabel("연도"); plt.ylabel("원/주")
+        plt.grid(True); plt.gca().yaxis.set_major_formatter(fmt)
+        plt.legend(); plt.tight_layout(); plt.show()
+
+    _plot_one("EPS", "EPS 추이 및 예측 (원/주)")
+    _plot_one("BPS", "BPS 추이 및 예측 (원/주)")
+
+# --------------------------
+# 6) 실행 예시
+# --------------------------
+if __name__ == "__main__":
+    stock_code = input("종목코드 (예: 005930): ").strip()
+
+    # pykrx로 상장주식수만 확보
+    try:
+        shares = get_listed_shares_by_pykrx(stock_code)
+    except ModuleNotFoundError:
+        raise SystemExit("[오류] pykrx 미설치: pip install pykrx")
+    except Exception as e:
+        raise SystemExit(f"[오류] 상장주식수 조회 실패: {e}")
+
+    # all_df는 DART API로 가져온 실제 재무제표를 넣으세요.
+    # 아래는 테스트용 더미 (pandas 2.x: concat 사용)
+    df_profit = pd.DataFrame({
+        "year":[2021,2022,2023],
+        "account_nm":["당기순이익"]*3,
+        "thstrm_amount":[1.0e11, 1.2e11, 0.9e11]
+    })
+    df_equity = pd.DataFrame({
+        "year":[2021,2022,2023],
+        "account_nm":["자본총계"]*3,
+        "thstrm_amount":[2.3e13, 2.5e13, 2.7e13]
+    })
+    all_df = pd.concat([df_profit, df_equity], ignore_index=True)
+
+    eps_bps = build_eps_bps(all_df, shares)
+    print("[EPS/BPS]\n", eps_bps)
+
+    # 1년치 예측(원하면 years_ahead 변경)
+    fc = forecast_eps_bps(eps_bps, years_ahead=1)
+    print("\n[예측치]\n", fc)
+
+    plot_eps_bps_with_forecast(eps_bps, fc)
