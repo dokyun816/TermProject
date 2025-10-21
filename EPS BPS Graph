@@ -1,178 +1,170 @@
-# 표준 라이브러리 & 외부 라이브러리 임포트
-import os, io, zipfile, re, requests, pandas as pd, xml.etree.ElementTree as ET  # 파일, 네트워킹, 데이터 처리, XML 파싱
-from bs4 import BeautifulSoup  # HTML 파싱(Selector 기반)
-from io import StringIO  # ← 추가: 문자열 형태의 HTML을 판다스 read_html로 읽을 때 사용
+# ==== pykrx로 주식수 확보 → EPS/BPS 계산 → 간단 예측치 산출 ====
+import re, datetime as dt                # 정규식(re), 날짜/시간 처리(datetime) 모듈 임포트
+import numpy as np, pandas as pd         # 수치연산용 NumPy, 표 형태 데이터 처리용 Pandas
+import matplotlib.pyplot as plt          # 시각화(그래프)용 Matplotlib
+from matplotlib.ticker import FuncFormatter  # y축 눈금 형식 지정용 포매터
+import pykrx       # 한국거래소, 네이버 증권 데이터 불러오는 라이브러리
 
-# OpenDART API 인증키 (금융감독원 API 사용 시 필요)
-API_KEY = "32ba89ca15f1fde1cb7116b4e08b2959c861f4e4"
-
-# ── 회사명 -> 종목코드 (DART corpCode.xml)
-def _corp_df():
-    # DART에서 corpCode.xml(zip) 다운로드 URL
-    url = "https://opendart.fss.or.kr/api/corpCode.xml"
-    # HTTP GET으로 zip 파일 바이트 수신 후 ZipFile로 오픈 (timeout=15초)
-    z = zipfile.ZipFile(io.BytesIO(requests.get(url, params={"crtfc_key": API_KEY}, timeout=15).content))
-    # zip 안의 첫 번째 파일이 corpCode.xml 이므로 바로 읽어서 파싱
-    root = ET.fromstring(z.read(z.namelist()[0]))
-    # XML의 <list> 요소들에서 회사명/종목코드 추출 → 딕셔너리 리스트 구성
-    rows = [{"corp_name": e.findtext("corp_name"),
-             "stock_code": (e.findtext("stock_code") or "").strip()}
-            for e in root.findall(".//list")]
-    # 판다스 DataFrame으로 변환하여 반환
-    return pd.DataFrame(rows)
-
-# DART 기업코드 캐시 (최초 1회만 네트워크 호출하기 위함)
-_CORP = None
-
-def resolve_code(s: str) -> tuple[str, str]:
-    # 사용자 입력 전후 공백 제거
-    s = s.strip()
-    # 만약 6자리 숫자(정규식 매칭)면 이미 종목코드로 보고 그대로 반환 (회사명은 임시로 종목코드와 동일 값 반환)
-    if re.fullmatch(r"\d{6}", s):
-        return s, s
-    # API_KEY 필수 안내 (여기선 이미 상단에 고정되어 있으므로 통과)
-    if not API_KEY:
-        raise ValueError("회사명 매핑에는 DART_API_KEY가 필요합니다. (6자리 종목코드 입력 가능)")
-    # 전역 DataFrame 로딩 (최초 1회만 _corp_df 호출)
-    global _CORP
-    if _CORP is None:
-        _CORP = _corp_df()
-    # 회사명 부분일치(case-insensitive)로 검색
-    hit = _CORP[_CORP["corp_name"].str.contains(s, case=False, na=False)]
-    # 종목코드가 비어 있는(비상장 등) 행 제거
-    hit = hit[hit["stock_code"] != ""]
-    # 첫 번째 매칭 결과 선택 (※ 매칭 실패 시 IndexError 가능 → 실전에서는 예외처리 권장)
-    row = hit.iloc[0]
-    # (종목코드, 회사명) 튜플 반환
-    return row["stock_code"], row["corp_name"]
-
-# ── 숫자 파싱
+# --------------------------
+# 0) 유틸
 def _num(x):
+    if x is None: return np.nan          # None이면 NaN으로 통일
+    if isinstance(x, (int, float, np.number)): return float(x)  # 숫자형이면 float로 변환
+    # 문자열 안의 숫자/부호/소수점만 남기고 숫자로 강제 변환 (쉼표, 단위, 공백 제거)
+    return pd.to_numeric(re.sub(r"[^\d\-\.+]", "", str(x)), errors="coerce")
+
+# --------------------------
+# 1) pykrx: 상장주식수
+def _recent_trading_day():
+    from pykrx import stock              # 함수 내부 임포트(모듈 미설치 환경 대비/지연 로딩)
+    d = dt.date.today()                  # 오늘 날짜 기준으로
+    for _ in range(10):                  # 최대 10일 거슬러 올라가며
+        s = d.strftime("%Y%m%d")         # 'YYYYMMDD' 문자열로 변환
+        # 해당 날짜가 거래일이면 시가총액 데이터가 비어있지 않음 → 이 날짜를 사용
+        if not stock.get_market_cap_by_date(s, s, "005930").empty:
+            return s
+        d -= dt.timedelta(days=1)        # 전날로 한 칸 이동(주말·공휴일 스킵 목적)
+    return d.strftime("%Y%m%d")          # 마지막으로 확인한 날짜 반환(방어용)
+
+def get_listed_shares_by_pykrx(code: str) -> int:
+    from pykrx import stock              # pykrx 임포트
+    day = _recent_trading_day()          # 가장 최근 거래일 찾기
+    df = stock.get_market_cap_by_date(day, day, code)  # 해당일의 시가총액/상장주식수 테이블
+    if df.empty:                         # 비어 있으면 예외 처리
+        raise ValueError("KRX 데이터 비어 있음")
+    return int(df.iloc[0]["상장주식수"])  # 첫 행의 '상장주식수' 컬럼 값을 정수로 반환
+
+# --------------------------
+# 2) DART 표에서 연도별 항목 뽑기
+#    all_df: ['year' or 'bsns_year', 'account_nm', 'thstrm_amount']
+def _pick_yearly(df: pd.DataFrame, names: list[str]) -> pd.Series:
+    if df.empty or "account_nm" not in df: return pd.Series(dtype=float)  # 기본 검증
+    base = df[df["account_nm"].notna()].copy()      # 계정명 결측 제거
+    base["year"] = base.get("year", base.get("bsns_year"))  # 'year'가 없으면 'bsns_year' 사용
+    if base["year"] is None or base["year"].isna().all():   # 연도 정보 없으면 빈 시리즈
+        return pd.Series(dtype=float)
+
+    # 찾을 계정명 패턴(대소문자 무시) 구성: 예) '당기순이익|분기순이익|...'
+    pat = "|".join(map(lambda s: re.escape(s.casefold()), names))
+    # 계정명에 위 패턴이 포함된 행만 필터링
+    sub = base[base["account_nm"].astype(str).str.casefold().str.contains(pat, na=False)].copy()
+    if sub.empty: return pd.Series(dtype=float)     # 없으면 빈 시리즈
+
+    sub["thstrm_amount"] = sub["thstrm_amount"].map(_num)   # 금액을 숫자형으로 정규화
+    sub["year"] = pd.to_numeric(sub["year"], errors="coerce")# 연도 숫자화
+    sub = sub.dropna(subset=["thstrm_amount","year"])       # 핵심 컬럼 결측 제거
+    if sub.empty: return pd.Series(dtype=float)
+
+    sub["abs_amount"] = sub["thstrm_amount"].abs()  # 동일 연도에 중복 계정이 있으면 절댓값 큰 것 우선
+    # 연도 오름차순, 금액 절댓값 내림차순으로 정렬 후, 연도별 첫 행만 선택
+    pick = (sub.sort_values(["year","abs_amount"], ascending=[True, False])
+              .groupby("year", as_index=False).first())
+    # 인덱스: 연도(int), 값: 'thstrm_amount'으로 시리즈 구성 후 연도 기준 정렬
+    return pd.Series(pick["thstrm_amount"].values, index=pick["year"].astype(int)).sort_index()
+
+# --------------------------
+# 3) EPS/BPS 계산
+def build_eps_bps(all_df: pd.DataFrame, shares) -> pd.DataFrame:
+    sh = _num(shares)                                    # 주식수 숫자화
+    if all_df.empty or pd.isna(sh) or sh <= 0:           # 입력 검증
+        return pd.DataFrame()
+    # 당기순이익/총포괄손익 계정에서 연도별 금액 시리즈 추출 (연결 기준도 포괄)
+    ni = _pick_yearly(all_df, ["당기순이익","분기순이익","반기순이익","당기순손익","연결총포괄손익"])
+    # 자본총계/지배주주지분에서 연도별 금액 시리즈 추출
+    eq = _pick_yearly(all_df, ["자본총계","지배기업의소유주지분"])
+    years = sorted(set(ni.index) | set(eq.index))        # 두 시리즈의 연도 합집합
+    if not years: return pd.DataFrame()                  # 연도가 하나도 없으면 종료
+    out = pd.DataFrame(index=years, dtype=float)         # 연도를 인덱스로 결과 DF 생성
+    if not ni.empty: out["EPS"] = ni / sh                # EPS = 당기순이익 / 상장주식수
+    if not eq.empty: out["BPS"] = eq / sh                # BPS = 자본총계 / 상장주식수
+    return out
+
+# --------------------------
+# 4) 간단 예측치
+#    - EPS: 선형회귀(연도→EPS)로 1~k년 앞 예측
+#    - BPS: 과거 CAGR로 1~k년 앞 예측
+def forecast_eps_bps(eps_bps: pd.DataFrame, years_ahead: int = 1) -> pd.DataFrame:
+    if eps_bps.empty: return pd.DataFrame()              # 히스토리 없으면 예측 불가
+    idx_years = eps_bps.index.astype(int).to_numpy()     # 연도 인덱스를 정수 배열로
+    fut_years = np.arange(idx_years.max() + 1, idx_years.max() + 1 + years_ahead)  # 예측 연도 범위
+
+    # 예측 결과를 담을 DF(컬럼: EPS_pred, BPS_pred)
+    out = pd.DataFrame(index=fut_years, columns=["EPS_pred","BPS_pred"], dtype=float)
+
+    # EPS: 최소 2개 연도 이상이 있어야 1차 회귀 가능
+    if "EPS" in eps_bps and eps_bps["EPS"].notna().sum() >= 2:
+        x = idx_years[eps_bps["EPS"].notna()]           # 결측 아닌 연도만 사용
+        y = eps_bps.loc[x, "EPS"].to_numpy()            # 해당 연도의 EPS 값
+        m, b = np.polyfit(x, y, 1)                      # 1차 다항(직선) 회귀: y = m*x + b
+        out["EPS_pred"] = m * fut_years + b             # 미래 연도에 회귀선 대입
+
+    # BPS: CAGR(복리성장률) 기반 추정 (최소 2개 연도 필요)
+    if "BPS" in eps_bps and eps_bps["BPS"].notna().sum() >= 2:
+        bps = eps_bps["BPS"].dropna()                   # 결측 제거
+        y0, yN = int(bps.index.min()), int(bps.index.max())  # 첫 해, 마지막 해
+        n = yN - y0                                     # 경과 연수
+        if n > 0 and bps.loc[y0] > 0:                   # 분모 0 방지 및 기간 확인
+            cagr = (bps.loc[yN] / bps.loc[y0]) ** (1/n) - 1  # CAGR 계산
+            last_bps = bps.loc[yN]                      # 최근년도 BPS
+            # 1~k년까지 CAGR을 누적 적용하여 예측치 생성
+            preds = [last_bps * ((1 + cagr) ** t) for t in range(1, years_ahead + 1)]
+            out["BPS_pred"] = preds
+
+    return out                                          # 예측 DF 반환
+
+# --------------------------
+# 5) 간단 플롯
+# --------------------------
+def plot_eps_bps_with_forecast(hist: pd.DataFrame, fc: pd.DataFrame):
+    fmt = FuncFormatter(lambda y,_: f"{y:,.0f}")        # y축 숫자를 천단위 콤마/정수로 표시
+
+    def _plot_one(col, title):
+        plt.figure(figsize=(8,4.5))                     # 그림 크기
+        if col in hist and hist[col].notna().any():     # 히스토리 존재 시
+            y = hist[col].dropna(); x = y.index.astype(int)  # 연도와 값
+            plt.plot(x, y.values, marker="o", label=f"{col} (hist)")  # 실선 히스토리
+        if not fc.empty and f"{col}_pred" in fc and fc[f"{col}_pred"].notna().any():
+            y2 = fc[f"{col}_pred"].dropna(); x2 = y2.index.astype(int)  # 예측 연도와 값
+            plt.plot(x2, y2.values, marker="o", linestyle="--", label=f"{col} (pred)")  # 점선 예측
+        plt.title(title); plt.xlabel("연도"); plt.ylabel("원/주")   # 제목/축 레이블
+        plt.grid(True); plt.gca().yaxis.set_major_formatter(fmt) # 격자와 y축 포맷
+        plt.legend(); plt.tight_layout(); plt.show()     # 범례/레이아웃/표시
+
+    _plot_one("EPS", "EPS 추이 및 예측 (원/주)")         # EPS 그래프
+    _plot_one("BPS", "BPS 추이 및 예측 (원/주)")         # BPS 그래프
+
+# --------------------------
+# 6) 실행 예시
+if __name__ == "__main__":                               # 스크립트 직접 실행 시 동작
+    stock_code = input("종목코드 (예: 005930): ").strip() # 사용자로부터 종목코드 입력
+
+    # pykrx로 상장주식수만 확보
     try:
-        # 문자열에서 천단위 콤마와 '원' 제거 후 float 변환
-        return float(str(x).replace(",", "").replace("원", "").strip())
-    except:
-        # 변환 불가 시 None 반환 (향후 계산 단계에서 None 체크)
-        return None
+        shares = get_listed_shares_by_pykrx(stock_code)  # KRX에서 상장주식수 조회
+    except ModuleNotFoundError:
+        raise SystemExit("[오류] pykrx 미설치: pip install pykrx")  # 미설치 가이드
+    except Exception as e:
+        raise SystemExit(f"[오류] 상장주식수 조회 실패: {e}")        # 기타 실패 메시지
 
-# ── PER/PBR 연간표(최근 5년) - 표 인덱스 의존 제거 + StringIO 적용
-def per_pbr_5y(code: str) -> pd.DataFrame:
-    # 네이버 금융 종목 메인 페이지 HTML 요청 (UA 지정으로 차단 회피)
-    html = requests.get(f"https://finance.naver.com/item/main.nhn?code={code}",
-                        headers={"User-Agent": "Mozilla/5.0"}, timeout=15).text
-    # 페이지 내 모든 테이블을 순회하며 PER/PBR이 있는 표를 탐색
-    for df in pd.read_html(StringIO(html)):  # ← 수정: 문자열을 파일처럼 읽게 해줌
-        # 열이 2개 미만인 표는 의미 없으므로 스킵
-        if df.shape[1] < 2:
-            continue
-        # 컬럼명을 문자형 리스트로 정규화
-        cols = [str(c) for c in df.columns]
-        # 표 복사 후 첫 열을 '항목'으로 강제 지정 (인덱스 의존성 제거)
-        tmp = df.copy()
-        tmp.columns = ["항목"] + cols[1:]
-        # '항목' 열에 PER 또는 PBR 문자열이 없으면 스킵
-        if not tmp["항목"].astype(str).str.contains("PBR|PER", na=False).any():
-            continue
-        # 연도처럼 보이는(숫자 문자열) 컬럼만 추출
-        year_cols = [c for c in tmp.columns[1:] if str(c).isdigit()]
-        if not year_cols:
-            continue
-        # '항목' + 연도열만 남김
-        tmp = tmp.loc[:, ["항목"] + year_cols]
-        # 'PER'가 포함된 행의 연도별 수치만 슬라이스
-        per = tmp[tmp["항목"].astype(str).str.contains("PER", na=False)].iloc[0, 1:]
-        # 'PBR'가 포함된 행의 연도별 수치만 슬라이스
-        pbr = tmp[tmp["항목"].astype(str).str.contains("PBR", na=False)].iloc[0, 1:]
-        # DataFrame 구성 후 숫자 변환(에러는 NaN), NaN 행 제거
-        out = pd.DataFrame({
-            "PER": pd.to_numeric(per, errors="coerce"),
-            "PBR": pd.to_numeric(pbr, errors="coerce")
-        }).dropna()
-        # 인덱스 이름을 '연도'로 명시
-        out.index.name = "연도"
-        # 최근 5개 연도만 반환
-        return out.tail(5)
-    # 적합한 표를 못 찾으면 빈 DataFrame 반환 (PER/PBR 열만 사전정의)
-    return pd.DataFrame(columns=["PER", "PBR"])
+    # all_df는 DART API로 가져온 실제 재무제표를 넣으세요.
+    # 아래는 테스트용 더미 (pandas 2.x: concat 사용)
+    df_profit = pd.DataFrame({                           # 예시: 연도별 당기순이익(원)
+        "year":[2021,2022,2023],
+        "account_nm":["당기순이익"]*3,
+        "thstrm_amount":[1.0e11, 1.2e11, 0.9e11]
+    })
+    df_equity = pd.DataFrame({                           # 예시: 연도별 자본총계(원)
+        "year":[2021,2022,2023],
+        "account_nm":["자본총계"]*3,
+        "thstrm_amount":[2.3e13, 2.5e13, 2.7e13]
+    })
+    all_df = pd.concat([df_profit, df_equity], ignore_index=True)  # 두 표를 하나로 결합
 
-# ── 현재 스냅샷(EPS/BPS/현재가/시총) — 시총 None 보호
-def snapshot(code: str) -> dict:
-    # 네이버 금융 종목 페이지 HTML 요청
-    html = requests.get(f"https://finance.naver.com/item/main.nhn?code={code}",
-                        headers={"User-Agent": "Mozilla/5.0"}, timeout=15).text
-    # BeautifulSoup으로 파싱
-    s = BeautifulSoup(html, "lxml")
-    # 현재가: p.no_today 아래 .blind 텍스트(숫자)
-    price_el = s.select_one("p.no_today .blind")
-    price = _num(price_el.text) if price_el else None
-    # 시가총액: id="_market_sum" (네이버는 억원 단위 숫자를 제공)
-    mktcap_el = s.select_one("#_market_sum")
-    mktcap = _num(mktcap_el.text) if mktcap_el else None
-    # 단위 변환: 억원 → 원
-    # ※ 이 줄 때문에 결과가 '시가총액(원)'이 됨. 억원 표시를 원하시면 이 줄을 제거하세요.
-    if mktcap is not None:
-        mktcap *= 1e8  # 네이버는 억원 단위
-    # EPS/BPS: 재무 테이블에서 항목명 검색 후 오른쪽 셀 값 파싱
-    eps = bps = None
-    for tr in s.select("table.per_table tr"):
-        # 각 행의 th, td 텍스트를 리스트로 수집
-        cells = [t.get_text(strip=True) for t in tr.select("th,td")]
-        # 'EPS' 또는 'BPS'라는 키워드가 있는 셀의 오른쪽 값을 취함
-        for i, v in enumerate(cells):
-            if "EPS" in v and i + 1 < len(cells):
-                eps = _num(cells[i + 1]) or eps
-            if "BPS" in v and i + 1 < len(cells):
-                bps = _num(cells[i + 1]) or bps
-    # 현재가/시총/EPS/BPS를 딕셔너리로 반환
-    return {"price": price, "mktcap": mktcap, "EPS": eps, "BPS": bps}
+    eps_bps = build_eps_bps(all_df, shares)              # EPS/BPS 계산
+    print("[EPS/BPS]\n", eps_bps)                        # 계산 결과 출력
 
-# ── 실행
-# 사용자에게 회사명 또는 6자리 종목코드 입력 받기
-user = input("회사명 또는 6자리 종목코드를 입력하세요: ").strip()
-# 입력값을 종목코드/회사명으로 정규화
-code, name = resolve_code(user)
-# 최근 5년 PER/PBR 표 수집
-hist = per_pbr_5y(code)
-# 현재 스냅샷(가격/시총/EPS/BPS) 수집
-snap = snapshot(code)
+    # 1년치 예측(원하면 years_ahead 변경)
+    fc = forecast_eps_bps(eps_bps, years_ahead=1)        # 간단 예측(EPS 회귀 / BPS CAGR)
+    print("\n[예측치]\n", fc)                            # 예측 결과 출력
 
-# 5년 평균 PER/PBR (히스토리가 비어 있으면 None)
-avgPER = hist["PER"].mean() if not hist.empty else None
-avgPBR = hist["PBR"].mean() if not hist.empty else None
-# EPS/BPS 값 언패킹
-eps, bps = snap["EPS"], snap["BPS"]
-
-# 적정가(PER) = (5년평균 PER) × EPS
-tp_per = (avgPER * eps) if (avgPER and eps) else None
-# 적정가(PBR) = (5년평균 PBR) × BPS
-tp_pbr = (avgPBR * bps) if (avgPBR and bps) else None
-
-# 결과 요약 테이블(DataFrame) 구성
-summary = pd.DataFrame({
-    "종목": [name],
-    "코드": [code],
-    "현재가": [snap["price"]],       # 원 단위
-    "시가총액(원)": [snap["mktcap"]],  # 위에서 억→원 변환했기 때문에 '원'이 맞음
-    "EPS(원)": [eps],
-    "BPS(원)": [bps],
-    "5년평균 PER": [None if avgPER is None else round(avgPER, 2)],
-    "5년평균 PBR": [None if avgPBR is None else round(avgPBR, 2)],
-    "적정가(PER)": [None if tp_per is None else round(tp_per, 0)],
-    "적정가(PBR)": [None if tp_pbr is None else round(tp_pbr, 0)]
-})
-
-# 표 출력 형식 지정 (천 단위 콤마, 소수점 등)
-display(summary.style.format({
-    "현재가": "{:,.0f}",
-    "시가총액(원)": "{:,.0f}",  # 원 단위 금액 포맷
-    "EPS(원)": "{:,.0f}",
-    "BPS(원)": "{:,.0f}",
-    "5년평균 PER": "{:,.2f}",
-    "5년평균 PBR": "{:,.2f}",
-    "적정가(PER)": "{:,.0f}",
-    "적정가(PBR)": "{:,.0f}"
-}))
-
-# PER/PBR 히스토리가 있으면 연도 오름차순으로 함께 출력
-if not hist.empty:
-    display(hist.rename_axis("연도").sort_index())
+    plot_eps_bps_with_forecast(eps_bps, fc)              # 히스토리+예측 그래프 출력
