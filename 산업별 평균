@@ -17,8 +17,8 @@ def latest_krx_trading_day(d: dt.date | None = None) -> str:   # 가장 최근 �
     """KRX 포맷 'YYYYMMDD'로 최근 거래일 문자열 반환"""
     if d is None: # 기준일이 없으면 오늘 날짜 기준
         d = dt.date.today()
-    # pykrx는 휴일/주말에 '당일'을 넣으면 빈 DF가 올 수 있어요.
-    # 전일→전전일 순으로 7일 이내에서 가장 최근 거래일을 찾습니다.
+    # pykrx는 휴일/주말에 '당일'을 넣으면 빈 DF가 올 수 있음.
+    # 전일→전전일 순으로 7일 이내에서 가장 최근 거래일을 찾음음.
     for i in range(7):       # 최대 일주일 거슬러 올라가며 확인
         day = d - dt.timedelta(days=i)     # i일 전 날짜
         ymd = day.strftime("%Y%m%d") # 포맷팅
