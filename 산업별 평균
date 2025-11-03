@@ -1,218 +1,164 @@
-# 산업 평균 및 경쟁사 비교 데이터
-import datetime as dt      # 날짜 계산을 위한 표준 라이브러리
-import time, re, requests        # time(지연/재시도), re(정규식), requests(HTTP 요청)
-import pandas as pd       # 표형 데이터 처리(병합/집계/정리)
-import matplotlib.pyplot as plt      # 시각화(막대그래프 등)
-from bs4 import BeautifulSoup     # HTML 파싱(네이버 금융에서 섹터 정보 추출)
-from pykrx import stock     # KRX(국내) 시세/지표 데이터 수집
+# 적정주가와 투자 매력 등급을 계산·요약해 출력
+from pykrx import stock                       # 모듈/패키지 import 문법: pykrx 패키지에서 stock 서브모듈만 가져옴
+import datetime as dt                         # as 별칭: datetime 모듈을 dt라는 이름으로 사용
+import pandas as pd                           # 관례적 별칭: pandas→pd
+import numpy as np                            # 관례적 별칭: numpy→np
+import requests, io, zipfile, xml.etree.ElementTree as ET  # 콤마로 여러 모듈 동시 import, as로 별칭
+import re                                     # 정규표현식 모듈
 
-TARGET = input("분석할 종목코드(6자리, 예: 005930) 입력: ").strip()  # 사용자로부터 6자리 티커 입력
-if not TARGET.isdigit() or len(TARGET) != 6:                         # 숫자 6자리인지 검증
-    raise ValueError("종목코드는 6자리 숫자로 입력해야 합니다. 예: 005930")  # 잘못된 입력 시 즉시 예외
-COMPARE_METRIC = "PER"   # "PER" 또는 "PBR" 선택    # 비교 지표 기본값 (per로 고정.)
-EXCLUDE_NONPOSITIVE = True  # PER/PBR이 0 이하/NaN인 종목 제외   # 이상치 필터링 여부
+API_KEY = "32ba89ca15f1fde1cb7116b4e08b2959c861f4e4"  
+# ── 회사명/코드 변환 (stock_code, corp_code)
+def get_codes(target: str):                   # 함수 정의 def, 매개변수에 타입힌트(: str)
+    url = "https://opendart.fss.or.kr/api/corpCode.xml"  # 지역변수 할당
+    z = zipfile.ZipFile(                      # zipfile.ZipFile: ZIP 파일 열기
+        io.BytesIO(                           # io.BytesIO: 바이트 스트림을 파일처럼 다룸
+            requests.get(                     # requests.get: HTTP GET 호출
+                url, params={"crtfc_key": API_KEY}, timeout=15  # 쿼리스트링 dict, 타임아웃 초 단위
+            ).content                         # Response.content: 바이너리 응답 바디
+        )
+    )                                        
+    root = ET.fromstring(                     # XML 문자열을 Element 트리로 파싱
+        z.read(z.namelist()[0])               # z.namelist(): ZIP 내부 파일명 리스트, [0] 첫 파일
+    )
+    rows = [                                  # 리스트 내포(list comprehension): 반복하며 dict 생성
+        {
+            "corp_name": (e.findtext("corp_name") or "").strip(),   # .findtext: 하위태그 텍스트, None 대비 or "", .strip 공백제거
+            "stock_code": (e.findtext("stock_code") or "").strip(), # 6자리 종목코드(비상장일 수 있어 빈문자열 가능)
+            "corp_code":  (e.findtext("corp_code") or "").strip()   # DART 내부 8자리 법인코드
+        }
+        for e in root.findall(".//list")       # .findall: XPath 유사 선택자, 모든 <list> 요소 반복
+    ]
+    df = pd.DataFrame(rows)                    # 판다스 DataFrame 생성(행 리스트 → 테이블)
+    target = target.strip()                    # 문자열 메서드 .strip(): 양쪽 공백 제거
+    if re.fullmatch(r"\d{6}", target):         # 정규식 완전일치: 6자리 숫자면 종목코드로 간주
+        hit = df[df["stock_code"] == target]   # 불리언 인덱싱: 조건으로 행 선택
+    else:
+        hit = df[df["corp_name"] == target]    # 회사명 완전일치 먼저 시도
+        if hit.empty:                          # DataFrame.empty: 행이 없으면 True
+            hit = df[df["corp_name"].str.contains(target, na=False)]  # 부분일치: .str.contains, na=False로 NaN 제외
+    if hit.empty or hit.iloc[0]["stock_code"] == "":  # .iloc[0]: 첫 행, or로 두 조건 중 하나라도 참이면
+        raise ValueError("해당 상장사를 찾을 수 없습니다.")  # 예외 발생(프로그램 중단)
+    r = hit.iloc[0]                             # 첫 매칭 행을 시리즈로 추출
+    return r["stock_code"], r["corp_code"]      # 다중 반환(tuple): (종목코드, 법인코드)
 
-#===최근 거래일 유틸===
-def latest_krx_trading_day(d: dt.date | None = None) -> str:   # 가장 최근 거래일을 'YYYYMMDD' 문자열로 반환
-    """KRX 포맷 'YYYYMMDD'로 최근 거래일 문자열 반환"""
-    if d is None: # 기준일이 없으면 오늘 날짜 기준
-        d = dt.date.today()
-    # pykrx는 휴일/주말에 '당일'을 넣으면 빈 DF가 올 수 있음.
-    # 전일→전전일 순으로 7일 이내에서 가장 최근 거래일을 찾음음.
-    for i in range(7):       # 최대 일주일 거슬러 올라가며 확인
-        day = d - dt.timedelta(days=i)     # i일 전 날짜
-        ymd = day.strftime("%Y%m%d") # 포맷팅
-        if not stock.get_market_fundamental(ymd, market="KOSPI").empty:  # 해당일 코스피 지표가 비어있지 않으면
-            return ymd   # 그 날짜를 최근 거래일로 반환
-    # 안전장치
-    return (d - dt.timedelta(days=1)).strftime("%Y%m%d")    # 혹시 모를 경우 전일로 강제 반환
+# ── 분석 기준일: 종목 PER>0 그리고 시장 avg PER>0 인 최근일
+def find_analysis_day(code, days=60):          # 최근 60일(약 2개월) 안에서 유효한 거래일을 찾음
+    today = dt.datetime.now()                  # 현재 날짜시간 객체(now는 클래스 메서드)
+    for d in range(days):                      # for-range 반복: 0..days-1
+        day = (today - dt.timedelta(days=d)).strftime("%Y%m%d")  # 날짜 뺄셈(timedelta), strftime 포맷팅
+        qd = stock.get_nearest_business_day_in_a_week(day)       # pykrx 유틸: 입력일자 기준 가장 가까운 영업일 문자열
 
-#===전시장(코스피/코스닥) PER·PBR 테이블===
-def get_fundamentals_krx(ymd: str) -> pd.DataFrame: # 입력된 날짜의 KOSPI+KOSDAQ 지표 테이블 생성
-    """코스피+코스닥 전 종목의 PER/PBR/EPS/BPS를 병합한 테이블"""
-    kospi = stock.get_market_fundamental(ymd, market="KOSPI")  # 코스피 지표 조회
-    kosdaq = stock.get_market_fundamental(ymd, market="KOSDAQ")# 코스닥 지표 조회
-    df = pd.concat([kospi, kosdaq], axis=0)  # 두 시장 데이터를 행 방향으로 결합
-    # 컬럼 표준화
-    df = df.rename(columns={"BPS":"BPS", "PER":"PER", "PBR":"PBR", "EPS":"EPS"})  # 혹시 모를 컬럼명 일치화
-    df.index.name = "Ticker"    # 인덱스(티커) 이름 지정
-    # 종목명 붙이기
-    names = {t: stock.get_market_ticker_name(t) for t in df.index}  # 티커→종목명 매핑 생성
-    df["Name"] = pd.Series(names)     # 매핑을 열로 추가
-    # 수치형 보정
-    for c in ["PER","PBR","EPS","BPS"]:   # 관심 지표들에 대해
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")      # 문자열/오염값을 NaN으로 강제 변환
-    return df.reset_index()   # 종목 코드드를 일반 컬럼으로 되돌려 반환
+        fund = stock.get_market_fundamental_by_date(qd, qd, code)  # 해당일의 단일 종목 펀더멘털 조회
+        if fund.empty:                           # 빈 DF면 다음 반복으로 continue
+            continue
+        per = pd.to_numeric(                     # 안전형 변환: 숫자/문자 → float, 변환불가시 NaN
+            fund["PER"].iloc[0], errors="coerce" # 첫 행의 "PER" 값
+        )
+        if not (pd.notna(per) and per > 0):      # pd.notna: NaN 아님, and 논리연산, per>0 양수 확인
+            continue
 
-#===업종/경쟁사 불러오기===
-_NAVER_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}  # 네이버 접근 시 UA 설정(차단 회피용 기본값)
+        ind = stock.get_market_fundamental_by_ticker(qd, market="ALL")  # 그날 전체 종목 지표. ind:
+        if ind.empty or "PER" not in ind.columns:  # 컬럼 존재성 검사
+            continue
+        ind_per = pd.to_numeric(ind["PER"], errors="coerce")            # 전체 PER를 수치로 변환
+        ind_per = ind_per[(ind_per > 0) & ind_per.notna()]              # 불리언 마스크 결합(&): 양수이면서 NaN 아님
+        if ind_per.empty:                                               # 유효 표본 없으면
+            continue
 
-def _get(url: str, params=None, retry=3, sleep=0.5) -> requests.Response:     # 단순 재시도 HTTP GET 유틸
-    for _ in range(retry):                                                    # 최대 retry회 시도
-        r = requests.get(url, params=params, headers=_NAVER_HEADERS, timeout=10)  # 요청 전송
-        if r.status_code == 200:   # 정상 응답이면
-            return r       # 즉시 반환
-        time.sleep(sleep)   # 실패 시 잠깐 대기 후 재시도
-    r.raise_for_status()   # 반복 후에도 실패면 예외
-    return r  # (도달하지 않음)
-
-def naver_sector_info_from_ticker(ticker: str) -> tuple[str, str]:            # 종목코드로부터 네이버 업종 번호/이름 추출
-    """
-    입력: 종목코드(6자리)
-    반환: (sector_no, sector_name)
-    """
-    url = "https://finance.naver.com/item/main.naver"     # 종목 상세 페이지
-    r = _get(url, params={"code": ticker})   # 요청
-    soup = BeautifulSoup(r.text, "lxml")  # HTML 파싱
-
-    # 업종 링크 예: /sise/sise_group_detail.naver?type=upjong&no=###
-    a_tags = soup.select('a[href*="sise_group_detail"]')  # 업종 상세로 가는 링크들 선택
-    for a in a_tags:
-        href = a.get("href", "")   # href 추출
-        if "type=upjong" in href and "no=" in href:   # 업종 링크 조건 확인
-            m = re.search(r"no=(\d+)", href)   # no=숫자 패턴 추출
-            if m:
-                return m.group(1), a.get_text(strip=True)   # (업종번호, 업종명) 반환
-    raise RuntimeError("섹터(업종) 정보를 찾지 못했습니다. (네이버 구조 변경 가능)")  # 실패 시 예외
-
-def naver_sector_constituents(sector_no: str) -> list[str]:   # 업종 번호로 업종 소속 종목코드 목록 수집
-    """
-    업종 번호 → 업종 구성 종목코드 리스트
-    """
-    url = "https://finance.naver.com/sise/sise_group_detail.naver"  # 업종 상세 페이지
-    r = _get(url, params={"type": "upjong", "no": sector_no})  # 요청(업종 no로 필터)
-    soup = BeautifulSoup(r.text, "lxml")    # HTML 파싱(xml로 가져옴)
-
-    # 테이블 내 종목 링크: /item/main.naver?code=###### 형태
-    codes = set()   # 중복 방지 위해 set 사용
-    for a in soup.select('a[href*="/item/main.naver?code="]'):                # 종목 상세 링크들 순회
-        href = a.get("href", "")    # href 추출
-        m = re.search(r"code=(\d{6})", href)    # 6자리 코드 패턴
-        if m:
-            codes.add(m.group(1))   # 종목코드를 집합에 추가
-    return sorted(codes)  # 정렬해 리스트로 반환
-
-#===상대 지표 계산
-def compute_relative_metric(df: pd.DataFrame, target: str, peers: list[str], metric: str = "PER",
-                            exclude_nonpositive: bool = True) -> dict:        # 업종 평균 대비 상대지표/할인율 계산
-    """
-    df: get_fundamentals_krx 결과
-    target: 대상 티커
-    peers: 업종 구성 티커 리스트(섹터 자동 수집)
-    metric: "PER" 또는 "PBR"
-    exclude_nonpositive: 0/음수/NaN 제거 여부
-    """
-    metric = metric.upper()   # 대문자 통일
-    if metric not in {"PER", "PBR"}:                                         
-        raise ValueError("metric은 'PER' 또는 'PBR'만 허용됩니다.")
-
-    sub = df[df["Ticker"].isin(peers)].copy()   # 업종 소속 종목만 필터링(결측치 확인. isin()메서드)
-    if exclude_nonpositive:   # 이상치 제거 옵션이 켜져 있으면
-        sub = sub[sub[metric].notna() & (sub[metric] > 0)]   # NaN/0/음수 제거
-
-    sector_avg = sub[metric].mean() if not sub.empty else float("nan")        # 업종 평균 계산(없으면 NaN)
-
-    trow = df[df["Ticker"] == target]    # 타겟 행 선택
-    if trow.empty:       # 타겟이 없으면 예외
-        raise ValueError("타겟 종목이 펀더멘털 테이블에 없습니다.")
-    trow = trow.iloc[0]         # 단일 행으로 정리
-    tname = trow["Name"]     # 타겟 종목명
-    tval = float(trow[metric]) if pd.notna(trow[metric]) else float("nan")    # 타겟 지표값(숫자형)
-
-    rel = tval / sector_avg if (pd.notna(tval) and pd.notna(sector_avg) and sector_avg != 0) else float("nan")  # 상대지표
-    disc = (rel - 1.0) * 100 if pd.notna(rel) else float("nan")       # 할인율(상대지표-1)*100
-
-    return {  # 계산 결과를 딕셔너리로 반환
-        "target_ticker": target,
-        "target_name": tname,
-        "metric": metric,
-        "target_value": tval,
-        "sector_avg": sector_avg,
-        "relative": rel,
-        "discount_pct": disc,
-        "peer_count_used": int(sub.shape[0])
-    }
-
-#===시각화(막대그래프)====
-def plot_relative_bar(per: float, sector_avg: float, title: str, subtitle: str = ""):  # 종목 vs 업종 평균 막대 그래프
-    """
-    두 개 막대(종목 PER vs 업종평균 PER) + 할인율 주석
-    """
-    fig, ax = plt.subplots(figsize=(5,4), dpi=130)   # 그림/축 생성(해상도 조정)
-
-    labels = ["종목 PER", "업종 평균 PER"]  # 눈금 라벨
-    values = [per, sector_avg]   # 값(종목, 업종평균)
-    ax.bar(labels, values)  # 막대그래프 그리기
-
-    # 라벨/제목
-    ax.set_title(title + (f"\n{subtitle}" if subtitle else ""), pad=10)   # 제목/부제목(날짜)
-    ax.set_ylabel("배 (x)")     # y축 단위 표기
-    # 값 표시
-    for i, v in enumerate(values):     # 막대 위에 수치 라벨 붙이기
-        ax.text(i, v, f"{v:.2f}배", ha="center", va="bottom", fontsize=10)
-
-    # 할인율 계산 (음수면 '할인', 양수면 '프리미엄')
-    if pd.notna(per) and pd.notna(sector_avg) and sector_avg != 0:             # 유효값일 때만 주석 표시
-        discount = (per/sector_avg - 1) * 100     # 할인율 계산
-        note = f"상대 PER = {per/sector_avg:.2f}배 → {'할인' if discount<0 else '프리미엄'} {discount:+.1f}%"  # 주석 문구
-        ax.text(0.5, max(values)*1.05, note, ha="center", va="bottom", fontsize=11)  # 그래프 상단 중앙에 표기
-
-    plt.tight_layout()    # 레이아웃 겹침 방지
-    plt.show()    # 그래프 표시
-
-#===메인 실행===
-def main(target_code: str, metric: str = "PER"):       # 전체 흐름 제어 함수
-    ymd = latest_krx_trading_day()   # 최근 거래일 계산
-    print(f"[최근 거래일] {ymd}")       # 로그 출력
-
-    # 1) 타겟의 섹터 자동 매핑
-    sector_no, sector_name = naver_sector_info_from_ticker(target_code)        # 네이버에서 업종 번호/이름 추출
-    print(f"[섹터 매핑] {target_code} → 업종번호 {sector_no}, 업종명 '{sector_name}'")  # 매핑 결과 표시
-
-    # 2) 해당 섹터 구성 종목코드
-    peers = naver_sector_constituents(sector_no)    # 업종 소속 전체 종목코드 수집
-    if target_code not in peers:                                                # 타겟이 목록에 없을 때(간혹 누락)
-        # 네이버 업종 구성 목록에 타겟이 누락되어도 비교엔 포함시키는 편이 안전
-        peers = sorted(set(peers) | {target_code})     # 타겟을 강제로 포함
-    print(f"[섹터 구성 종목 수] {len(peers)}개")      # 구성 종목 수 표시(간결 로그로 바꿀 수 있음)
-
-    # 3) 펀더멘털 (pykrx)
-    all_fund = get_fundamentals_krx(ymd)     # KOSPI+KOSDAQ 지표 테이블 수집
-
-    # 4) 상대지표 계산
-    res = compute_relative_metric(   # 업종 평균 대비 상대 지표/할인율 산출
-        df=all_fund,
-        target=target_code,
-        peers=peers,
-        metric=metric,
-        exclude_nonpositive=EXCLUDE_NONPOSITIVE
+        return qd                                # 조건 만족하는 가장 최근 영업일을 즉시 반환
+    # 못 찾으면 오늘 영업일
+    return stock.get_nearest_business_day_in_a_week(  
+        dt.datetime.now().strftime("%Y%m%d")
     )
 
-    # 5) 요약 출력
-    metric_kor = "PER" if metric.upper() == "PER" else "PBR"    # 어떤 지표를 기준으로 할지 결정
-    tname = res["target_name"]                                                
+# ── DART 매출액 CAGR
+def sales_cagr(corp_code: str, years: int = 6):  # 매개변수에 타입힌트 및 기본값(int)
+    this_year = dt.datetime.now().year           # .year 속성: 정수 연도
+    names = ["매출액","수익(매출액)","수익","Revenue","매출","영업수익(매출액)",
+             "영업수익","매출수익","매출고","Sales"]  # 리스트 리터럴(여러 후보명)
+    vals = []                                     # 빈 리스트 초기화(연도,값) 쌍 저장
+    for y in range(this_year, this_year - (years + 2), -1):  # 역순 range: 올해→과거
+        url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"  # DART 단일계정 API
+        p = { "crtfc_key": API_KEY, "corp_code": corp_code,            # dict 리터럴(쿼리파라미터)
+              "bsns_year": str(y), "reprt_code": "11011" }             # str(y): 정수→문자열
+        data = requests.get(url, params=p, timeout=15).json()          # .json(): JSON→파이썬 dict
+        lst = data.get("list") or []            # dict.get 기본값, or []로 None 대비
+        if not lst:                             # 빈 리스트면 False로 평가 → if not
+            continue
+        df = pd.DataFrame(lst)                  # 리스트(dict들)→DataFrame
+        df = df[df["sj_div"].isin(["IS","CIS","IS2","CIS2"])]  # .isin: 다중값 필터(손익계산서만)
+        pick = None                             # 선택값 초기화(None: 값 없음의 표준)
+        for nm in names:                        # 후보명 순회
+            hit = df[(df["fs_div"]=="CFS") & df["account_nm"].str.contains(nm, na=False)]  # 연결재무제표 우선
+            if hit.empty:                       # 없으면
+                hit = df[(df["fs_div"]=="OFS") & df["account_nm"].str.contains(nm, na=False)]  # 별도재무제표
+            if not hit.empty:                   # 하나라도 찾으면
+                pick = hit.iloc[0]; break       # 첫 행 선택; 세미콜론으로 같은 줄에 2문장 가능, break로 for 탈출
+        if pick is not None:                    # None 체크
+            s = re.sub(r"[^0-9.\-]", "", str(pick["thstrm_amount"]) or "")  # re.sub로 숫자/점/마이너스만 남김
+            if s not in ("", "-", "."):         # 빈/의미없는 값 필터
+                vals.append((y, float(s)))      # float 변환 후 튜플 추가
 
-    summary_df = pd.DataFrame({   # 데이터 프레임으로 출력결과 묶기
-        "항목": ["종목", metric_kor, "업종명", f"업종평균 {metric_kor}",
-                f"상대 {metric_kor}", "할인율(%)", "표본 종목 수"],
-        "값": [
-            f"{tname}({res['target_ticker']})",   # 종목명(회사코드)
-            f"{res['target_value']:.2f}배" if pd.notna(res["target_value"]) else "N/A",  # 종목 지표값
-            sector_name,                                                       # 업종명
-            f"{res['sector_avg']:.2f}배" if pd.notna(res["sector_avg"]) else "N/A",  # 업종 평균
-            f"{res['relative']:.2f}배" if pd.notna(res["relative"]) else "N/A",  # 상대 지표
-            f"{res['discount_pct']:+.1f}%" if pd.notna(res["discount_pct"]) else "N/A",  # 할인율(+/- 부호 포함)
-            f"{res['peer_count_used']}개"   # 평균 계산에 사용된 표본 수
-        ]
-    })
-    print("\n 분석 결과 요약")       # 제목
-    print(summary_df.to_string(index=False))   # DataFrame을 표로 출력
+    vals = sorted(set(vals))                    # set으로 중복 제거 후 sorted로 정렬(연도 오름차순)
+    if len(vals) < 2:                           # 최소 2점(시작/끝) 필요
+        return np.nan                           # numpy NaN 반환
+    y0, v0 = vals[0]; y1, v1 = vals[-1]        # 시퀀스 언패킹: 첫 요소, 마지막 요소
+    if v0 <= 0 or v1 <= 0:                      # 분모/분자 양수 조건
+        return np.nan
+    n = max(1, y1 - y0)                         # 0 나눗셈 방지: 최소 1년
+    return (v1 / v0) ** (1 / n) - 1             # CAGR 공식: (끝/시작)^(1/년수) - 1
 
-    # 6) 그래프
-    subtitle = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"      # 날짜를 사람이 읽기 쉬운 형식으로
-    title = f"{tname} {metric_kor} vs {sector_name} 평균"       # 그래프 제목
-    plot_relative_bar(res["target_value"], res["sector_avg"], title=title, subtitle=subtitle)  # 그래프 호출
+# ── 메인
+target = input("분석할 종목명 또는 코드 입력: ").strip()  # input: 콘솔 입력 받기, .strip 공백 제거
+code, corp_code = get_codes(target)                # 다중 할당: 튜플 (code, corp_code) 언패킹
+qdate = find_analysis_day(code, days=60)           # 키워드 인자(days=60) 전달
 
-if __name__ == "__main__":      # 모듈이 아니라 스크립트로 실행될 때만
-    main(TARGET, metric=COMPARE_METRIC)     # 메인 함수 호출(사용자 입력/설정 반영)
+price = int(                                        # int(): 정수 변환
+    stock.get_market_ohlcv_by_date(qdate, qdate, code)["종가"].iloc[0]  # 시계열 DF에서 컬럼→첫 값
+)
+fund = stock.get_market_fundamental_by_date(qdate, qdate, code).iloc[0] # 단일행 DataFrame을 시리즈로
+
+PER = pd.to_numeric(fund.get("PER"), errors="coerce")  # dict-like .get: 키 없을 때 None, 숫자 변환
+EPS = pd.to_numeric(fund.get("EPS"), errors="coerce")
+BPS = pd.to_numeric(fund.get("BPS"), errors="coerce")
+
+# EPS<=0 이면 ROE는 N/A로 표시
+if pd.notna(EPS) and pd.notna(BPS) and BPS and BPS > 0 and EPS > 0:  # 다중 조건 and, 0/None은 False로 평가
+    ROE = float(EPS / BPS * 100)                                     # 산술연산, float 강제
+else:
+    ROE = np.nan                                                     # NaN 지정
+
+cagr = sales_cagr(corp_code)                                         # 함수 호출, 반환값 저장
+sales_growth = round(cagr * 100, 1) if pd.notna(cagr) else np.nan    # 조건부 표현식(삼항연산자), round(소수1자리)
+
+ind = stock.get_market_fundamental_by_ticker(qdate, market="ALL")    # 같은 날 전체 종목 지표
+ind_per = pd.to_numeric(ind["PER"], errors="coerce")                 # 시리즈를 수치로 변환
+ind_per = ind_per[(ind_per > 0) & ind_per.notna()]                   # 불리언 마스크 결합(&)
+avg_per = ind_per.mean() if not ind_per.empty else np.nan            # if-else 표현식: 평균 또는 NaN
+
+fair = round(price * (avg_per / PER)) if (pd.notna(PER) and PER > 0 and pd.notna(avg_per) and avg_per > 0) else None
+# 위 한 줄: 조건부 표현식으로 적정가 산출 또는 None
+
+def valu_txt(px, fv):                                    # 함수 정의(지역 스코프)
+    if fv is None: return "평가 불가"                    # 단일 라인 return(조기 반환)
+    diff = round((fv - px) / px * 100, 1)                # 괴리율(%) 계산
+    if diff > 10: return f"{diff}% 저평가 구간"          # f-string: 표현식 삽입형 포맷
+    if diff > 0:  return f"{diff}% 소폭 저평가"
+    if diff > -10:return f"{abs(diff)}% 소폭 고평가"     # abs: 절댓값
+    return f"{abs(diff)}% 고평가 구간"
+
+val_comment = valu_txt(price, fair)                      # 함수 호출, 반환 문자열 저장
+grade = (                                                # 괄호로 여러 줄 표현(연산자 우선)
+    "중상" if (pd.notna(ROE) and ROE >= 10) and (pd.notna(sales_growth) and sales_growth >= 5)
+    else "보통" if (pd.notna(ROE) and ROE >= 7) or (pd.notna(sales_growth) and sales_growth >= 3)
+    else "하"                                           # 중첩 삼항(조건부 표현식)으로 등급 분기
+)
+
+# 출력
+print(f"\n[분석 대상] {target} ({code})")                # \n 줄바꿈, f-string 포맷
+print(f"\n[분석 기준일] {qdate}")                        # 변수 삽입 출력
+print(f"현재가 {price:,.0f}원 / 적정가 {(f'{fair:,.0f}원' if fair else '산출불가')}")  
+# :,.0f 포맷 지정자: 천단위 콤마, 소수 0자리 / 내부 f-string을 또 f-string으로 넣는 중첩 표현
+print(f"→ 동종 업종 평균 대비 {val_comment}")           # 화살표 기호와 문자열 연결
+print(
+    f"→ ROE {(f'{ROE:.1f}%' if pd.notna(ROE) else 'N/A')}
