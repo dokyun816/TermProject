@@ -1,0 +1,24 @@
+#검색화면
+import streamlit as st
+
+st.set_page_config(page_title="기업 재무 분석", layout="wide")
+
+st.title("기업 재무 분석 — 검색")
+q = st.text_input("회사명 또는 종목코드 (예: 삼성전자 또는 005930)")
+
+# Streamlit 1.30+ 권장: st.query_params
+if st.button("분석"):
+    if q.strip():
+        st.query_params["q"] = q.strip()
+        # 페이지 이동(최신: st.switch_page)
+        try:
+            st.switch_page("pages/1_Dashboard.py")
+        except Exception:
+            # 구버전 호환: 상태값 + rerun
+            st.session_state["_route"] = "dashboard"
+            st.session_state["q"] = q.strip()
+            st.rerun()
+
+# 구버전 fallback: 세션 라우팅
+if st.session_state.get("_route") == "dashboard":
+    st.write("대시보드로 이동 중...")
